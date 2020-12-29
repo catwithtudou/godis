@@ -17,23 +17,23 @@ import (
 )
 
 type Client struct {
-    conn        net.Conn
-    sendingReqs chan *Request // waiting sending
-    waitingReqs chan *Request // waiting response
-    ticker      *time.Ticker
+    conn        net.Conn //与服务端的tcp连接
+    sendingReqs chan *Request // 等待发送的请求
+    waitingReqs chan *Request // 等待服务器响应的请求
+    ticker      *time.Ticker // 用于触发心跳包的计时器
     addr        string
 
-    ctx        context.Context
-    cancelFunc context.CancelFunc
-    writing    *sync.WaitGroup
+    ctx        context.Context // 优雅关闭处理
+    cancelFunc context.CancelFunc // 优雅关闭处理
+    writing    *sync.WaitGroup // 有请求正在处理不能立即停止，用于实现优雅关闭
 }
 
 type Request struct {
-    id        uint64
-    args      [][]byte
-    reply     redis.Reply
-    heartbeat bool
-    waiting   *wait.Wait
+    id        uint64 // 请求id
+    args      [][]byte // 参数
+    reply     redis.Reply // 收到的返回值
+    heartbeat bool // 标记是否是心跳请求
+    waiting   *wait.Wait // 通过协程发送请求后通过waitGroup等待异步处理完成
     err       error
 }
 
@@ -43,6 +43,7 @@ const (
 )
 
 func MakeClient(addr string) (*Client, error) {
+    //建立客户端连接
     conn, err := net.Dial("tcp", addr)
     if err != nil {
         return nil, err
@@ -70,13 +71,13 @@ func (client *Client) Start() {
 }
 
 func (client *Client) Close() {
-    // stop new request
+    // 阻止新请求进入队列
     close(client.sendingReqs)
 
-    // wait stop process
+    // 等待处理中的请求处理完毕
     client.writing.Wait()
 
-    // clean
+    // 释放资源
     client.cancelFunc()
     _ = client.conn.Close()
     close(client.waitingReqs)
@@ -125,7 +126,9 @@ loop:
     for {
         select {
         case req := <-client.sendingReqs:
+            //增加未完成请求
             client.writing.Add(1)
+            //发送请求
             client.doRequest(req)
         case <-client.ctx.Done():
             break loop
@@ -141,8 +144,8 @@ func (client *Client) Send(args [][]byte) redis.Reply {
         waiting:   &wait.Wait{},
     }
     request.waiting.Add(1)
-    client.sendingReqs <- request
-    timeout := request.waiting.WaitWithTimeout(maxWait)
+    client.sendingReqs <- request // 将请求发往处理队列
+    timeout := request.waiting.WaitWithTimeout(maxWait) // 等待请求处理完成或者超时
     if timeout {
         return reply.MakeErrReply("server time out")
     }
@@ -153,10 +156,14 @@ func (client *Client) Send(args [][]byte) redis.Reply {
 }
 
 func (client *Client) doRequest(req *Request) {
+    //序列化
     bytes := reply.MakeMultiBulkReply(req.args).ToBytes()
+    //tcp connection
     _, err := client.conn.Write(bytes)
     i := 0
+    //重试机制
     for err != nil && i < 3 {
+        //断开当前连接 重新建立新连接
         err = client.handleConnectionError(err)
         if err == nil {
             _, err = client.conn.Write(bytes)
@@ -164,23 +171,30 @@ func (client *Client) doRequest(req *Request) {
         i++
     }
     if err == nil {
+        //将发送成功请求放入等待响应队列
         client.waitingReqs <- req
     } else {
         req.err = err
+        //结束调用者等待
         req.waiting.Done()
+        //结束该请求
         client.writing.Done()
     }
 }
 
 func (client *Client) finishRequest(reply redis.Reply) {
+    //取出等待响应的req
     request := <-client.waitingReqs
     request.reply = reply
     if request.waiting != nil {
+        //结束调用者的等待
         request.waiting.Done()
     }
+    //减小完成的请求数
     client.writing.Done()
 }
 
+// Redis协议解析器 RESP
 func (client *Client) handleRead() error {
     reader := bufio.NewReader(client.conn)
     downloading := false
